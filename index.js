@@ -11,27 +11,30 @@ const io = new Server(httpServer, { cors: { origin: "*" } });
 
 // --- Config ---
 const PORT = process.env.PORT || 3000;
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const APP_URL = process.env.APP_URL?.replace(/\/$/, ""); // Убираем слэш на конце, если есть
-const WEBHOOK_SECRET = process.env.TWITCH_WEBHOOK_SECRET || "super_secret_key_123";
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID?.trim();
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET?.trim();
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN?.trim();
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim();
+
+// Render автоматически предоставляет RENDER_EXTERNAL_URL, используем его как запасной вариант!
+const RAW_APP_URL = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL;
+const APP_URL = RAW_APP_URL ? RAW_APP_URL.trim().replace(/\/$/, "") : null;
+const WEBHOOK_SECRET = (process.env.TWITCH_WEBHOOK_SECRET || "super_secret_key_123").trim();
 
 // Настройки для GitHub Gist
-const GIST_ID = process.env.GIST_ID;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GIST_ID = process.env.GIST_ID?.trim();
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN?.trim();
 const GIST_FILENAME = "streamers.json";
 
 // --- State & Storage ---
 let monitoredStreamers = [];
 let appAccessToken = null;
 let isBotActive = true;
+const processedMessages = new Set(); // Защита от повторной отправки одного и того же вебхука
 
-// Загрузка стримеров из GitHub Gist
 async function loadStreamers() {
   if (!GIST_ID || !GITHUB_TOKEN) {
-    console.warn("⚠️ GIST_ID или GITHUB_TOKEN не заданы! Список будет храниться только в памяти.");
+    console.warn("⚠️ GIST_ID или GITHUB_TOKEN не заданы! Список хранится только в памяти.");
     return;
   }
   try {
@@ -47,7 +50,9 @@ async function loadStreamers() {
       monitoredStreamers = parsed.map(s => ({
         ...s,
         record: s.record ?? true,
-        quality: s.quality ?? "best"
+        quality: s.quality ?? "best",
+        lastTitle: s.lastTitle ?? null,
+        lastCategory: s.lastCategory ?? null
       }));
       console.log(`📂 Загружено стримеров из Gist: ${monitoredStreamers.length}`);
     } else {
@@ -60,11 +65,9 @@ async function loadStreamers() {
   }
 }
 
-// Сохранение стримеров в GitHub Gist
 async function saveStreamers() {
   if (!GIST_ID || !GITHUB_TOKEN) return;
   try {
-    // Чтобы не затирать Gist лишний раз при смене только статуса онлайна, сохраняем чистую конфигурацию
     await axios.patch(
       `https://api.github.com/gists/${GIST_ID}`,
       {
@@ -101,7 +104,7 @@ if (bot) {
     const res = await addStreamer(login);
     if (res.error) return ctx.reply(`❌ ${res.error}`);
     await saveStreamers();
-    ctx.reply(`✅ Added ${login}. Notifications are ON, but PC Recording is OFF by default. Use /record ${login} to enable recording.`);
+    ctx.reply(`✅ Added ${login}. Notifications are ON, PC Recording is OFF by default. Use /record ${login} to enable recording.`);
   });
 
   bot.command("remove", async (ctx) => {
@@ -172,6 +175,28 @@ if (bot) {
     ctx.reply(`🎥 Recording quality for ${streamer.login} set to: ${quality}\n\n${QUALITY_LABELS[quality]}`);
   });
 
+  // НОВАЯ КОМАНДА: Проверка статуса вебхуков прямо из Telegram!
+  bot.command("webhooks", async (ctx) => {
+    if (!appAccessToken) await getAppAccessToken();
+    try {
+      const subsRes = await axios.get("https://api.twitch.tv/helix/eventsub/subscriptions", {
+        headers: { "Client-ID": TWITCH_CLIENT_ID, Authorization: `Bearer ${appAccessToken}` }
+      });
+      const subs = subsRes.data.data;
+      if (subs.length === 0) {
+        return ctx.reply(`⚠️ Вебхуков нет!\nТекущий APP_URL: ${APP_URL || "НЕ ЗАДАН"}`);
+      }
+      const summary = subs.map(s => {
+        const st = monitoredStreamers.find(m => m.id === s.condition.broadcaster_user_id);
+        const name = st ? st.login : s.condition.broadcaster_user_id;
+        return `• ${name}: ${s.type} (v${s.version}) — [${s.status}]`;
+      }).join("\n");
+      ctx.reply(`📡 Активные вебхуки (${subs.length}):\nURL: ${APP_URL}\n\n${summary}`);
+    } catch (err) {
+      ctx.reply(`❌ Ошибка проверки вебхуков: ${err.message}`);
+    }
+  });
+
   bot.command("commands", (ctx) => {
     ctx.reply(
       "📖 Available Commands:\n\n" +
@@ -180,7 +205,7 @@ if (bot) {
       "/list — Show all monitored streamers with status\n" +
       "/record <username> — Toggle PC recording on/off\n" +
       "/quality <username> <quality> — Set recording quality\n" +
-      "   Options: best | 1080p | 720p | 480p | audio_only\n" +
+      "/webhooks — Check Twitch EventSub status\n" +
       "/id — Get your Telegram Chat ID\n" +
       "/commands — Show this help message"
     );
@@ -197,7 +222,6 @@ if (bot) {
 async function startBot() {
   if (!bot) return;
   try {
-    // dropPendingUpdates помогает избежать спама старыми командами при перезапуске на Render
     await bot.launch({ dropPendingUpdates: true });
     console.log("✅ Telegram Bot launched!");
   } catch (err) {
@@ -210,7 +234,6 @@ async function startBot() {
   }
 }
 
-// Корректная остановка бота при перезапуске контейнера Render
 process.once("SIGINT", () => bot && isBotActive && bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot && isBotActive && bot.stop("SIGTERM"));
 
@@ -245,9 +268,7 @@ async function addStreamer(login) {
     }
     return streamer;
   } catch (err) {
-    if (err.response?.status === 401) {
-      await getAppAccessToken();
-    }
+    if (err.response?.status === 401) await getAppAccessToken();
     return { error: err.message };
   }
 }
@@ -270,8 +291,19 @@ async function unsubscribeFromEventSub(userId) {
   }
 }
 
+// ИСПРАВЛЕНО: У каждого события своя актуальная версия по стандарту Twitch API
+const EVENTSUB_TYPES = [
+  { type: "stream.online", version: "1" },
+  { type: "stream.offline", version: "1" },
+  { type: "channel.update", version: "2" }, // Версия 2 обязательна!
+];
+
 async function syncEventSub() {
-  if (!APP_URL || !appAccessToken) return;
+  if (!APP_URL) {
+    console.warn("⚠️ APP_URL не задан! Вебхуки Twitch EventSub НЕ могут быть зарегистрированы.");
+    return;
+  }
+  if (!appAccessToken) await getAppAccessToken();
   const callbackUrl = `${APP_URL}/api/twitch/webhook`;
   
   try {
@@ -280,15 +312,16 @@ async function syncEventSub() {
     });
     
     const existingSubs = subsRes.data.data;
-    console.log(`📡 Twitch has ${existingSubs.length} active subscriptions.`);
+    console.log(`📡 Twitch has ${existingSubs.length} active subscriptions. Target callback: ${callbackUrl}`);
 
     for (const sub of existingSubs) {
       const isWrongUrl = sub.transport.callback !== callbackUrl;
-      const isFailed = sub.status === "notification_failures_exceeded";
+      const isFailed = sub.status !== "enabled" && sub.status !== "webhook_callback_verification_pending";
       const isOrphaned = !monitoredStreamers.find(s => s.id === sub.condition.broadcaster_user_id);
+      const isOldVersion = sub.type === "channel.update" && sub.version !== "2";
       
-      if (isWrongUrl || isFailed || isOrphaned) {
-        let reason = isWrongUrl ? "URL Mismatch" : (isFailed ? "Failed" : "Orphaned");
+      if (isWrongUrl || isFailed || isOrphaned || isOldVersion) {
+        let reason = isWrongUrl ? "URL Mismatch" : (isFailed ? `Status: ${sub.status}` : (isOldVersion ? "Old v1" : "Orphaned"));
         console.log(`🗑️ Deleting invalid sub: ${sub.type} (Reason: ${reason})`);
         await axios.delete(`https://api.twitch.tv/helix/eventsub/subscriptions?id=${sub.id}`, {
           headers: { "Client-ID": TWITCH_CLIENT_ID, Authorization: `Bearer ${appAccessToken}` }
@@ -296,28 +329,30 @@ async function syncEventSub() {
       }
     }
 
-    const types = ["stream.online", "stream.offline", "channel.update"];
     for (const streamer of monitoredStreamers) {
-      for (const type of types) {
+      for (const { type, version } of EVENTSUB_TYPES) {
         const alreadyExists = existingSubs.find(s => 
           s.type === type && 
+          s.version === version &&
           s.condition.broadcaster_user_id === streamer.id &&
           s.transport.callback === callbackUrl &&
-          s.status !== "notification_failures_exceeded"
+          (s.status === "enabled" || s.status === "webhook_callback_verification_pending")
         );
 
         if (!alreadyExists) {
           try {
             await axios.post("https://api.twitch.tv/helix/eventsub/subscriptions", {
-              type, version: "1", condition: { broadcaster_user_id: streamer.id },
+              type,
+              version,
+              condition: { broadcaster_user_id: streamer.id },
               transport: { method: "webhook", callback: callbackUrl, secret: WEBHOOK_SECRET }
             }, { headers: { "Client-ID": TWITCH_CLIENT_ID, Authorization: `Bearer ${appAccessToken}` } });
-            console.log(`✅ Subscribed: ${type} for ${streamer.login}`);
+            console.log(`✅ Subscribed: ${type} (v${version}) for ${streamer.login}`);
           } catch (err) {
             if (err.response?.status === 409) {
               console.log(`ℹ️ ${type} for ${streamer.login} already exists.`);
             } else {
-              console.error(`❌ Sub Error (${type}):`, err.response?.data || err.message);
+              console.error(`❌ Sub Error (${type} for ${streamer.login}):`, err.response?.data || err.message);
             }
           }
         }
@@ -330,7 +365,6 @@ async function syncEventSub() {
 
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-// --- Эндпоинты для поддержания активности (Anti-Sleep) ---
 app.get("/", (req, res) => res.send("🤖 Stream Monitor is running!"));
 app.get("/ping", (req, res) => res.status(200).json({ status: "ok", time: new Date().toISOString() }));
 
@@ -338,27 +372,45 @@ app.post("/api/twitch/webhook", (req, res) => {
   const signature = req.headers["twitch-eventsub-message-signature"];
   const messageId = req.headers["twitch-eventsub-message-id"];
   const timestamp = req.headers["twitch-eventsub-message-timestamp"];
+  const messageType = req.headers["twitch-eventsub-message-type"];
 
-  if (!signature || !req.rawBody) return res.sendStatus(400);
+  if (!signature || ! messageId || !timestamp || !req.rawBody) {
+    return res.sendStatus(400);
+  }
 
+  // ИСПРАВЛЕНО: Передаем Buffer напрямую без конкатенации со строками, чтобы кириллица и эмодзи не ломали HMAC
   const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET)
-    .update(messageId + timestamp + req.rawBody)
+    .update(messageId)
+    .update(timestamp)
+    .update(req.rawBody)
     .digest("hex");
 
   if (`sha256=${hmac}` !== signature) {
-    console.warn("⚠️ Invalid Webhook Signature");
+    console.warn("⚠️ Invalid Webhook Signature! Check TWITCH_WEBHOOK_SECRET.");
     return res.sendStatus(403);
   }
 
-  if (req.headers["twitch-eventsub-message-type"] === "webhook_callback_verification") {
-    console.log("✅ Webhook Verified!");
-    return res.send(req.body.challenge);
+  // Верификация вебхука при создании подписки
+  if (messageType === "webhook_callback_verification") {
+    console.log(`✅ Webhook Verified for ${req.body.subscription?.type}!`);
+    return res.status(200).type("text/plain").send(req.body.challenge);
+  }
+
+  // Защита от дублей (если Twitch прислал ретрай)
+  if (processedMessages.has(messageId)) {
+    return res.sendStatus(200);
+  }
+  processedMessages.add(messageId);
+  if (processedMessages.size > 500) {
+    const firstItem = processedMessages.values().next().value;
+    processedMessages.delete(firstItem);
   }
 
   const { subscription, event } = req.body;
-  const streamer = monitoredStreamers.find(s => s.id === event.broadcaster_user_id);
+  const streamer = monitoredStreamers.find(s => s.id === event?.broadcaster_user_id);
 
-  if (streamer) {
+  if (streamer && subscription) {
+    console.log(`⚡ [WEBHOOK] Event ${subscription.type} received for ${streamer.login}`);
     if (subscription.type === "stream.online") {
       if (streamer.status === "offline") {
         streamer.status = "online";
@@ -367,6 +419,9 @@ app.post("/api/twitch/webhook", (req, res) => {
     } else if (subscription.type === "stream.offline") {
       streamer.status = "offline";
     } else if (subscription.type === "channel.update") {
+      // Обновляем кеш заголовка, чтобы поллинг не дублировал уведомление
+      streamer.lastTitle = event.title;
+      streamer.lastCategory = event.category_name;
       notifyUpdate(event);
     }
   }
@@ -400,7 +455,7 @@ function notifyUpdate(event) {
   const title = event.title;
   const category = event.category_name;
   
-  console.log(`📝 [UPDATE] ${login} updated stream info.`);
+  console.log(`📝 [UPDATE] ${login} updated stream info: ${title} (${category})`);
   
   if (bot && TELEGRAM_CHAT_ID) {
     const message = `📝 ${login} updated stream info:\n\n` +
@@ -420,15 +475,39 @@ async function pollTwitch() {
     const res = await axios.get(`https://api.twitch.tv/helix/streams?user_login=${logins}`, {
       headers: { "Client-ID": TWITCH_CLIENT_ID, Authorization: `Bearer ${appAccessToken}` },
     });
-    const liveIds = new Set(res.data.data.map(s => s.user_id));
+    
+    const liveStreamsMap = new Map(res.data.data.map(s => [s.user_id, s]));
     
     monitoredStreamers.forEach(s => {
-      const isNowOnline = liveIds.has(s.id);
+      const streamData = liveStreamsMap.get(s.id);
+      const isNowOnline = Boolean(streamData);
+
       if (isNowOnline && s.status === "offline") {
         s.status = "online";
+        s.lastTitle = streamData.title;
+        s.lastCategory = streamData.game_name;
         notifyLive(s);
       } else if (!isNowOnline && s.status === "online") {
         s.status = "offline";
+      } else if (isNowOnline && s.status === "online") {
+        // Запасная проверка смены названия во время стрима, если вебхук вдруг не дошел
+        const currentTitle = streamData.title;
+        const currentCategory = streamData.game_name;
+        if (
+          (s.lastTitle !== null && s.lastTitle !== currentTitle) ||
+          (s.lastCategory !== null && s.lastCategory !== currentCategory)
+        ) {
+          s.lastTitle = currentTitle;
+          s.lastCategory = currentCategory;
+          notifyUpdate({
+            broadcaster_user_login: s.login,
+            title: currentTitle,
+            category_name: currentCategory
+          });
+        } else if (s.lastTitle === null) {
+          s.lastTitle = currentTitle;
+          s.lastCategory = currentCategory;
+        }
       }
     });
   } catch (err) {
@@ -448,6 +527,7 @@ loadStreamers().then(() => {
   getAppAccessToken().then(async () => {
     httpServer.listen(PORT, "0.0.0.0", async () => {
       console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🌐 External URL: ${APP_URL || "NOT SET"}`);
       
       startBot();
       setInterval(pollTwitch, 30000);
@@ -456,7 +536,6 @@ loadStreamers().then(() => {
         console.log("📡 Syncing Webhooks...");
         await syncEventSub();
 
-        // Дополнительный self-ping каждые 10 минут через внешний роутер Render
         setInterval(() => {
           axios.get(`${APP_URL}/ping`).catch(() => {});
         }, 10 * 60 * 1000);
